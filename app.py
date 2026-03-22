@@ -150,6 +150,34 @@ def detect_support_resistance(daily_df, current_price, tolerance=0.005):
     near = any(abs(current_price - l) / current_price <= tolerance for l in levels)
     return near, levels
 
+# ================= NIFTY TREND FILTER =================
+@st.cache_data(ttl=300)
+def get_nifty_trend():
+    """
+    Returns: 'Bullish' | 'Bearish' | 'Sideways'
+    Logic: NIFTY 5m close vs 20-candle EMA
+    """
+    try:
+        nifty = yf.Ticker("^NSEI")
+        df    = nifty.history(period="1d", interval="5m")
+        if df.empty or len(df) < 20:
+            return "Sideways"
+        df["EMA20"] = df["Close"].ewm(span=20).mean()
+        last_close  = df["Close"].iloc[-1]
+        last_ema    = df["EMA20"].iloc[-1]
+        prev_close  = df["Close"].iloc[-2]
+        prev_ema    = df["EMA20"].iloc[-2]
+        # Bullish: close above EMA and rising
+        if last_close > last_ema and last_close > prev_close:
+            return "Bullish"
+        # Bearish: close below EMA and falling
+        elif last_close < last_ema and last_close < prev_close:
+            return "Bearish"
+        else:
+            return "Sideways"
+    except Exception:
+        return "Sideways"
+
 # ================= SHARED SCORE ENGINE =================
 def compute_score(curr, prev, intraday_window, daily_sub, prev_day, today_day):
     current_price    = curr["Close"]
@@ -162,11 +190,52 @@ def compute_score(curr, prev, intraday_window, daily_sub, prev_day, today_day):
     vol_ratio = curr["Volume"] / avg_vol if avg_vol else 0
     vol_spike = vol_ratio >= 2.0
 
-    first_c        = intraday_window.iloc[0]
-    orb_high_break = current_price > first_c["High"]
-    orb_low_break  = current_price < first_c["Low"]
-    prev_high_break= current_price > prev_day["High"]
-    prev_low_break = current_price < prev_day["Low"]
+    # ORB — First 15-minute candle range (9:15 AM – 9:30 AM)
+    # Merge first 3 x 5m candles (or first 1 x 15m candle) into the 15m opening range
+    try:
+        from datetime import time as dtime
+        ct = curr["Datetime"]
+        ct_naive = ct.replace(tzinfo=None) if hasattr(ct, "tzinfo") and ct.tzinfo else ct
+        candle_time = ct_naive.time() if hasattr(ct_naive, "time") else ct_naive
+
+        # Build 15m opening range from intraday_window candles between 9:15 and 9:30
+        orb_candles = intraday_window[
+            intraday_window["Datetime"].apply(
+                lambda x: dtime(9, 15) <= (x.replace(tzinfo=None) if hasattr(x, "tzinfo") and x.tzinfo else x).time() < dtime(9, 30)
+            )
+        ]
+
+        if not orb_candles.empty:
+            orb_high = orb_candles["High"].max()   # highest point of 9:15–9:30
+            orb_low  = orb_candles["Low"].min()    # lowest point of 9:15–9:30
+        else:
+            # fallback: use first available candle
+            orb_high = intraday_window.iloc[0]["High"]
+            orb_low  = intraday_window.iloc[0]["Low"]
+
+        # Rule 1: Close confirmation — must close above/below ORB, not just wick
+        orb_close_above = curr["Close"] > orb_high
+        orb_close_below = curr["Close"] < orb_low
+
+        # Rule 2: Time window — ORB signal only valid 9:30 AM to 11:00 AM
+        orb_in_window = dtime(9, 30) <= candle_time <= dtime(11, 0)
+
+        # Rule 3: ORB range must be <= 1.5x ATR (filter volatile/gap opens)
+        daily_atr_orb  = (daily_sub["High"] - daily_sub["Low"]).tail(10).mean()
+        orb_range      = orb_high - orb_low
+        orb_range_ok   = (orb_range <= 1.5 * daily_atr_orb) if daily_atr_orb else True
+
+    except Exception:
+        orb_close_above = orb_close_below = False
+        orb_in_window   = True
+        orb_range_ok    = True
+
+    # Final ORB — all 3 rules must pass
+    orb_high_break = orb_close_above and orb_in_window and orb_range_ok
+    orb_low_break  = orb_close_below and orb_in_window and orb_range_ok
+
+    prev_high_break = current_price > prev_day["High"]
+    prev_low_break  = current_price < prev_day["Low"]
 
     bull_engulf          = is_bullish_engulfing(prev, curr)
     bear_engulf          = is_bearish_engulfing(prev, curr)
@@ -221,12 +290,33 @@ def compute_score(curr, prev, intraday_window, daily_sub, prev_day, today_day):
     if final_score < 2:
         signal = "NEUTRAL"
 
+    # ── CONFLUENCE CATEGORY SCORE (0–4) ──────────────────────────────
+    # Each category that has at least one signal = +1 confluence point
+    # 4/4 = signals from ALL categories = highest quality setup
+    cat_structure  = structure in ("Uptrend", "Downtrend")
+    cat_candle     = any(r in " ".join(reasons) for r in
+                         ["Engulfing", "Hammer", "Shooting Star", "Strong"])
+    cat_breakout   = any(r in " ".join(reasons) for r in
+                         ["ORB", "Prev Day"])
+    cat_momentum   = any(r in " ".join(reasons) for r in
+                         ["Volume Spike", "R-Factor"])
+    confluence     = sum([cat_structure, cat_candle, cat_breakout, cat_momentum])
+
+    # Confluence label
+    if confluence == 4:   confluence_label = "PERFECT ⭐"
+    elif confluence == 3: confluence_label = "STRONG 🔥"
+    elif confluence == 2: confluence_label = "MODERATE ⚡"
+    else:                 confluence_label = "WEAK 🔸"
+
     return {
         "signal": signal, "score": final_score, "reasons": reasons,
         "r_factor": round(r_factor, 2), "vol_ratio": round(vol_ratio, 2),
         "vol_spike": vol_spike, "structure": structure,
         "price_change_pct": round(price_change_pct, 2),
         "inside_bar": inside_bar, "outside_bar": outside_bar,
+        "confluence": confluence, "confluence_label": confluence_label,
+        "cat_structure": cat_structure, "cat_candle": cat_candle,
+        "cat_breakout": cat_breakout, "cat_momentum": cat_momentum,
     }
 
 # ================= LIVE ANALYZE =================
@@ -260,22 +350,36 @@ def analyze_stock(symbol, timeframe="5m"):
         sl     = round(cp - 1.5 * atr, 2) if sc["signal"] == "BUY" else round(cp + 1.5 * atr, 2)
         target = round(cp + 3.0 * atr, 2) if sc["signal"] == "BUY" else round(cp - 3.0 * atr, 2)
 
+        nifty_trend  = get_nifty_trend()
+        nifty_align  = (
+            (sc["signal"] == "BUY"  and nifty_trend == "Bullish") or
+            (sc["signal"] == "SELL" and nifty_trend == "Bearish")
+        )
+
         return {
-            "Stock":       symbol.replace(".NS", ""),
-            "Symbol":      symbol,
-            "Price":       round(cp, 2),
-            "Change %":    sc["price_change_pct"],
-            "Signal":      sc["signal"],
-            "Score":       sc["score"],
-            "R-Factor":    sc["r_factor"],
-            "Reasons":     " · ".join(sc["reasons"]) if sc["reasons"] else "—",
-            "Structure":   sc["structure"],
-            "Vol Ratio":   sc["vol_ratio"],
-            "Vol Spike":   sc["vol_spike"],
-            "Inside Bar":  "✅" if sc["inside_bar"]  else "",
-            "Outside Bar": "✅" if sc["outside_bar"] else "",
-            "Stop Loss":   sl,
-            "Target":      target,
+            "Stock":        symbol.replace(".NS", ""),
+            "Symbol":       symbol,
+            "Price":        round(cp, 2),
+            "Change %":     sc["price_change_pct"],
+            "Signal":       sc["signal"],
+            "Score":        sc["score"],
+            "Confluence":   sc["confluence"],
+            "Setup":        sc["confluence_label"],
+            "NIFTY":        nifty_trend,
+            "NIFTY ✔":     "✅" if nifty_align else "❌",
+            "R-Factor":     sc["r_factor"],
+            "Reasons":      " · ".join(sc["reasons"]) if sc["reasons"] else "—",
+            "Structure":    sc["structure"],
+            "Vol Ratio":    sc["vol_ratio"],
+            "Vol Spike":    sc["vol_spike"],
+            "Inside Bar":   "✅" if sc["inside_bar"]  else "",
+            "Outside Bar":  "✅" if sc["outside_bar"] else "",
+            "cat_structure": sc["cat_structure"],
+            "cat_candle":    sc["cat_candle"],
+            "cat_breakout":  sc["cat_breakout"],
+            "cat_momentum":  sc["cat_momentum"],
+            "Stop Loss":    sl,
+            "Target":       target,
         }
     except Exception:
         return None
@@ -389,10 +493,30 @@ def backtest_stock(symbol, timeframe="5m", rr_ratio=2.0, min_bt_score=5):
 # =====================================================================
 #                         MAIN UI
 # =====================================================================
-main_tab, bt_tab = st.tabs(["📡 Live Scanner", "📊 Backtest (30 Days)"])
+main_tab, bt_tab, pt_tab = st.tabs(["📡 Live Scanner", "📊 Backtest (30 Days)", "🤖 Paper Trading"])
 
 # ==================== LIVE SCANNER ====================
 with main_tab:
+    # ── NIFTY Trend Banner — always visible at top
+    nifty_now   = get_nifty_trend()
+    nifty_color = "#00ff88" if nifty_now == "Bullish" else ("#ff4466" if nifty_now == "Bearish" else "#fbbf24")
+    nifty_icon  = "📈" if nifty_now == "Bullish" else ("📉" if nifty_now == "Bearish" else "➡️")
+    nifty_tip   = ("✅ Market is UP — favour BUY signals only" if nifty_now == "Bullish"
+                   else "✅ Market is DOWN — favour SELL signals only" if nifty_now == "Bearish"
+                   else "⚠️ Market is SIDEWAYS — be selective, reduce size")
+    st.markdown(
+        f"<div style='background:#111827;border:1px solid {nifty_color};"
+        f"border-radius:10px;padding:12px 20px;margin-bottom:16px;"
+        f"display:flex;align-items:center;gap:14px'>"
+        f"<span style='font-size:1.6em'>{nifty_icon}</span>"
+        f"<div>"
+        f"<div style='color:#64748b;font-size:0.75em;margin-bottom:2px'>NIFTY 50 — Market Trend</div>"
+        f"<span style='color:{nifty_color};font-weight:800;font-size:1.2em'>{nifty_now}</span>"
+        f"&nbsp;&nbsp;<span style='color:#475569;font-size:0.85em'>{nifty_tip}</span>"
+        f"</div></div>",
+        unsafe_allow_html=True
+    )
+
     if run_button or auto_refresh:
         with st.spinner("⚡ Scanning price action across all stocks..."):
             df = run_scanner(tf_choice)
@@ -440,6 +564,16 @@ with main_tab:
             kpi(k5, df_sell.iloc[0]["Stock"] if not df_sell.empty else "—", "Top SELL", "#ff4466")
             st.markdown("<br>", unsafe_allow_html=True)
 
+            # ── Confluence breakdown
+            perfect = len(df[df["Confluence"] == 4])
+            strong  = len(df[df["Confluence"] == 3])
+            nifty_confirmed = len(df[df["NIFTY ✔"] == "✅"])
+            cf1, cf2, cf3 = st.columns(3)
+            cf1.metric("⭐ PERFECT setups (4/4)",   perfect)
+            cf2.metric("🔥 STRONG setups (3/4)",    strong)
+            cf3.metric("✅ NIFTY Confirmed signals", nifty_confirmed)
+            st.markdown("<br>", unsafe_allow_html=True)
+
             def render_cards(frame, sig_type):
                 if frame.empty:
                     st.info(f"No {sig_type} signals with score ≥ {min_score}")
@@ -451,20 +585,34 @@ with main_tab:
                     cc  = "#00ff88" if row["Change %"] >= 0 else "#ff4466"
                     bc  = "#00ff88" if sig_type == "BUY"    else "#ff4466"
                     sp  = int(row["Score"] * 10)
+                    # Confluence color
+                    c_val = row.get("Confluence", 0)
+                    c_color = "#ffd700" if c_val==4 else ("#00ff88" if c_val==3 else ("#fbbf24" if c_val==2 else "#94a3b8"))
+                    nifty_badge = row.get("NIFTY ✔", "")
+                    setup_label = row.get("Setup", "")
                     st.markdown(f"""
                     <div class='{css}'>
                       <div style='display:flex;justify-content:space-between;align-items:center'>
                         <div>
                           <span style='font-size:1.2em;font-weight:800;font-family:Syne,sans-serif'>{row['Stock']}</span>&nbsp;&nbsp;
                           <span class='{bcls}'>{arr} {sig_type}</span>&nbsp;
-                          <span style='color:#94a3b8;font-size:0.82em'>{row['Structure']}</span>
+                          <span style='color:#94a3b8;font-size:0.82em'>{row['Structure']}</span>&nbsp;&nbsp;
+                          <span style='color:{c_color};font-size:0.8em;font-weight:700'>{setup_label}</span>
                         </div>
                         <div style='text-align:right'>
                           <span style='font-size:1.3em;font-weight:700'>₹{row['Price']}</span>&nbsp;
                           <span style='color:{cc};font-size:0.9em'>{row['Change %']:+.2f}%</span>
                         </div>
                       </div>
-                      <div style='margin:8px 0 4px 0;color:#94a3b8;font-size:0.8em'>{row['Reasons']}</div>
+                      <div style='margin:6px 0 2px 0;font-size:0.78em'>
+                        <span style='color:#475569'>Categories: </span>
+                        <span style='color:{"#00ff88" if row.get("cat_structure") else "#334155"}'>■ Structure</span>&nbsp;
+                        <span style='color:{"#00ff88" if row.get("cat_candle") else "#334155"}'>■ Candle</span>&nbsp;
+                        <span style='color:{"#00ff88" if row.get("cat_breakout") else "#334155"}'>■ Breakout</span>&nbsp;
+                        <span style='color:{"#00ff88" if row.get("cat_momentum") else "#334155"}'>■ Momentum</span>&nbsp;&nbsp;
+                        <span style='color:#475569'>NIFTY:</span> {nifty_badge}
+                      </div>
+                      <div style='margin:4px 0;color:#94a3b8;font-size:0.8em'>{row['Reasons']}</div>
                       <div style='display:flex;justify-content:space-between;align-items:center;margin-top:6px'>
                         <div>
                           <span style='color:#64748b;font-size:0.75em'>SL </span><span style='color:#fbbf24;font-weight:700'>₹{row['Stop Loss']}</span>&nbsp;&nbsp;
@@ -472,7 +620,7 @@ with main_tab:
                           <span style='color:#64748b;font-size:0.75em'>Vol×</span><span style='color:#e2e8f0'>{row['Vol Ratio']}</span>&nbsp;&nbsp;
                           <span style='color:#64748b;font-size:0.75em'>R-Fac</span><span style='color:#c084fc;font-weight:700'>{row['R-Factor']}</span>
                         </div>
-                        <div style='font-size:0.78em;color:#64748b'>Score <b style='color:{bc}'>{row['Score']}/10</b></div>
+                        <div style='font-size:0.78em;color:#64748b'>Score <b style='color:{bc}'>{row['Score']}/10</b> &nbsp; Confluence <b style='color:{c_color}'>{c_val}/4</b></div>
                       </div>
                       <div class='score-bar-wrap'><div style='width:{sp}%;background:{bc};height:8px;border-radius:6px'></div></div>
                     </div>""", unsafe_allow_html=True)
@@ -611,6 +759,234 @@ with bt_tab:
                     <span style='color:#64748b'>ATR </span><span style='color:#c084fc'>₹{t['ATR']}</span>
                   </div>
                 </div>""", unsafe_allow_html=True)
+
+
+# ==================== PAPER TRADING ENGINE ====================
+PAPER_CSV = "paper_trades.csv"
+CAPITAL   = 100000.0
+RISK_PCT  = 0.02
+
+PT_COLS = ["id","stock","signal","score","reasons","entry","sl","target",
+           "qty","risk","status","entry_time","exit_time","exit_price",
+           "pnl","exit_reason","trailed"]
+
+def load_trades():
+    try:
+        df = pd.read_csv(PAPER_CSV)
+        for c in PT_COLS:
+            if c not in df.columns:
+                df[c] = ""
+        return df
+    except Exception:
+        return pd.DataFrame(columns=PT_COLS)
+
+def save_trades(df):
+    df.to_csv(PAPER_CSV, index=False)
+
+def open_trades(df):
+    return df[df["status"] == "OPEN"].copy() if not df.empty else pd.DataFrame(columns=PT_COLS)
+
+def closed_trades(df):
+    return df[df["status"] != "OPEN"].copy() if not df.empty else pd.DataFrame(columns=PT_COLS)
+
+def calc_qty(entry, sl):
+    risk_per_share = abs(entry - sl)
+    if risk_per_share == 0:
+        return 0
+    return max(1, int((CAPITAL * RISK_PCT) / risk_per_share))
+
+def paper_enter(df, stock, signal, score, reasons, entry, sl, target):
+    if not df.empty and ((df["stock"] == stock) & (df["status"] == "OPEN")).any():
+        return df, False
+    qty  = calc_qty(entry, sl)
+    risk = round(abs(entry - sl) * qty, 2)
+    new  = {
+        "id": len(df) + 1, "stock": stock, "signal": signal,
+        "score": score, "reasons": reasons,
+        "entry": round(entry,2), "sl": round(sl,2), "target": round(target,2),
+        "qty": qty, "risk": risk, "status": "OPEN",
+        "entry_time": datetime.now(IST).strftime("%Y-%m-%d %H:%M"),
+        "exit_time": "", "exit_price": "", "pnl": "", "exit_reason": "", "trailed": False,
+    }
+    df = pd.concat([df, pd.DataFrame([new])], ignore_index=True)
+    return df, True
+
+def paper_exit(df, idx, exit_price, exit_reason):
+    row   = df.loc[idx]
+    qty   = int(row["qty"])
+    entry = float(row["entry"])
+    sig   = row["signal"]
+    pnl   = round((exit_price - entry) * qty if sig == "BUY" else (entry - exit_price) * qty, 2)
+    df.loc[idx, "status"]      = "WIN" if pnl > 0 else "LOSS"
+    df.loc[idx, "exit_price"]  = round(exit_price, 2)
+    df.loc[idx, "exit_time"]   = datetime.now(IST).strftime("%Y-%m-%d %H:%M")
+    df.loc[idx, "pnl"]         = pnl
+    df.loc[idx, "exit_reason"] = exit_reason
+    return df
+
+def monitor_open_trades(df, tg_token, tg_chat_id, tg_on):
+    if df.empty:
+        return df, []
+    now_ist   = datetime.now(IST)
+    squareoff = now_ist.hour == 15 and now_ist.minute >= 15
+    messages  = []
+    open_df   = open_trades(df)
+    if open_df.empty:
+        return df, []
+    for idx in open_df.index:
+        row    = df.loc[idx]
+        stock  = row["stock"]
+        sig    = row["signal"]
+        entry  = float(row["entry"])
+        sl     = float(row["sl"])
+        target = float(row["target"])
+        qty    = int(row["qty"])
+        trailed= str(row["trailed"]) == "True"
+        try:
+            hist = yf.Ticker(stock + ".NS").history(period="1d", interval="5m")
+            if hist.empty:
+                continue
+            ltp  = round(float(hist["Close"].iloc[-1]), 2)
+            high = float(hist["High"].iloc[-1])
+            low  = float(hist["Low"].iloc[-1])
+        except Exception:
+            continue
+        if squareoff:
+            df = paper_exit(df, idx, ltp, "Square Off 3:15 PM")
+            pnl = float(df.loc[idx, "pnl"])
+            messages.append(("squareoff", f"Square Off: {stock} @ Rs.{ltp} | P&L: {'+'if pnl>=0 else ''}Rs.{pnl}"))
+            continue
+        if not trailed:
+            half = entry + (target - entry) * 0.5 if sig == "BUY" else entry - (entry - target) * 0.5
+            if (sig == "BUY" and ltp >= half) or (sig == "SELL" and ltp <= half):
+                df.loc[idx, "sl"]      = entry
+                df.loc[idx, "trailed"] = True
+                sl = entry; trailed = True
+                messages.append(("trail", f"Trail SL to Breakeven: {stock} SL = Rs.{entry}"))
+        if (sig == "BUY" and high >= target) or (sig == "SELL" and low <= target):
+            df = paper_exit(df, idx, target, "Target Hit")
+            pnl = float(df.loc[idx, "pnl"])
+            messages.append(("target", f"TARGET HIT: {stock} {sig} Rs.{entry} to Rs.{target} | P&L: +Rs.{pnl}"))
+            continue
+        if (sig == "BUY" and low <= sl) or (sig == "SELL" and high >= sl):
+            df = paper_exit(df, idx, sl, "Stop Loss Hit")
+            pnl = float(df.loc[idx, "pnl"])
+            messages.append(("sl", f"STOP LOSS: {stock} {sig} Rs.{entry} SL Rs.{sl} | P&L: Rs.{pnl}"))
+    if tg_on and tg_token and tg_chat_id:
+        for mtype, msg in messages:
+            send_telegram(tg_token, tg_chat_id, f"<b>Paper Trade Update</b>\n{msg}")
+    return df, messages
+
+
+with pt_tab:
+    st.markdown("### Robot Paper Trading Engine")
+    st.markdown("Virtual Rs.1,00,000 capital | 2 percent risk per trade | Auto entry/exit | Trail SL at 50 percent | Square off 3:15 PM")
+
+    pt_df = load_trades()
+
+    pc1, pc2, pc3, pc4 = st.columns(4)
+    run_pt   = pc1.button("Scan and Auto-Enter", key="run_pt")
+    monitor  = pc2.button("Monitor Open Trades", key="monitor_pt")
+    reset_pt = pc3.button("Reset All Trades",    key="reset_pt")
+
+    if pc4.button("Export CSV", key="export_pt") and not pt_df.empty:
+        st.download_button("Download trades.csv", pt_df.to_csv(index=False),
+                           file_name="paper_trades.csv", mime="text/csv")
+
+    if reset_pt:
+        save_trades(pd.DataFrame(columns=PT_COLS))
+        st.success("All paper trades reset.")
+        st.rerun()
+
+    if monitor:
+        with st.spinner("Checking live prices for open trades..."):
+            pt_df, msgs = monitor_open_trades(pt_df, tg_token, tg_chat_id, tg_enabled)
+            save_trades(pt_df)
+        if msgs:
+            for mtype, m in msgs:
+                if mtype == "target":   st.success(m)
+                elif mtype == "sl":     st.error(m)
+                elif mtype == "trail":  st.warning(m)
+                else:                   st.info(m)
+        else:
+            st.info("No updates yet. All trades still open and within range.")
+
+    if run_pt:
+        with st.spinner("Scanning for signals..."):
+            scan_df = run_scanner(tf_choice)
+        if scan_df.empty:
+            st.warning("No data. Try during market hours.")
+        else:
+            signals = scan_df[(scan_df["Score"] >= 7) & (scan_df["Vol Spike"] == True)]
+            entered = []
+            for _, row in signals.iterrows():
+                pt_df, ok = paper_enter(pt_df, row["Stock"], row["Signal"], row["Score"],
+                                        row["Reasons"], row["Price"], row["Stop Loss"], row["Target"])
+                if ok:
+                    entered.append(row["Stock"])
+                    if tg_enabled and tg_token and tg_chat_id:
+                        qty = calc_qty(row["Price"], row["Stop Loss"])
+                        send_telegram(tg_token, tg_chat_id,
+                            f"<b>Paper Trade ENTERED</b>\n{row['Stock']} {row['Signal']}\n"
+                            f"Entry: Rs.{row['Price']} SL: Rs.{row['Stop Loss']} TGT: Rs.{row['Target']}\n"
+                            f"Score: {row['Score']}/10 Qty: {qty}\n{row['Reasons']}")
+            save_trades(pt_df)
+            if entered:
+                st.success(f"Entered {len(entered)} new paper trades: {', '.join(entered)}")
+            else:
+                st.info("No new entries. No qualifying signals or stocks already have open trades.")
+
+    st.markdown("---")
+
+    closed_df  = closed_trades(pt_df)
+    open_df    = open_trades(pt_df)
+    total_pnl  = sum(float(x) for x in closed_df["pnl"] if x != "") if not closed_df.empty else 0
+    wins_pt    = len(closed_df[closed_df["status"] == "WIN"])  if not closed_df.empty else 0
+    losses_pt  = len(closed_df[closed_df["status"] == "LOSS"]) if not closed_df.empty else 0
+    closed_n   = wins_pt + losses_pt
+    wr_pt      = round(wins_pt / closed_n * 100, 1) if closed_n else 0
+    capital_now= round(CAPITAL + total_pnl, 2)
+
+    s1,s2,s3,s4,s5,s6 = st.columns(6)
+    def pkpi(col, val, label, color):
+        col.markdown(f"<div class='kpi-box'><div class='kpi-val' style='color:{color}'>{val}</div>"
+                     f"<div class='kpi-label'>{label}</div></div>", unsafe_allow_html=True)
+    pkpi(s1, f"Rs.{capital_now:,.0f}", "Capital",     "#60a5fa")
+    pkpi(s2, f"{'+ 'if total_pnl>=0 else ''}Rs.{abs(total_pnl):,.0f}", "Total P&L", "#00ff88" if total_pnl>=0 else "#ff4466")
+    pkpi(s3, len(open_df),  "Open Trades", "#fbbf24")
+    pkpi(s4, wins_pt,       "Wins",        "#00ff88")
+    pkpi(s5, losses_pt,     "Losses",      "#ff4466")
+    pkpi(s6, f"{wr_pt}%",   "Win Rate",    "#00ff88" if wr_pt>=50 else "#ff4466")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    if not open_df.empty:
+        st.markdown("#### Open Trades")
+        for idx, row in open_df.iterrows():
+            trailed_txt = " | SL Trailed to Breakeven" if str(row["trailed"]) == "True" else ""
+            sc = "green" if row["signal"] == "BUY" else "red"
+            st.markdown(
+                f"**{row['stock']}** `{row['signal']}`{trailed_txt} | "
+                f"Score: {row['score']}/10 | Entry: Rs.{row['entry']} | "
+                f"SL: Rs.{row['sl']} | TGT: Rs.{row['target']} | "
+                f"Qty: {row['qty']} | Risk: Rs.{row['risk']} | At: {row['entry_time']}"
+            )
+            st.caption(row["reasons"])
+            st.markdown("---")
+
+    if not closed_df.empty:
+        st.markdown("#### Closed Trades")
+        for _, row in closed_df.sort_values("exit_time", ascending=False).iterrows():
+            pnl_val = float(row["pnl"]) if row["pnl"] != "" else 0
+            icon    = "WIN" if row["status"] == "WIN" else "LOSS"
+            pnl_str = f"+Rs.{pnl_val}" if pnl_val >= 0 else f"Rs.{pnl_val}"
+            st.markdown(
+                f"**{row['stock']}** `{row['signal']}` | {icon} {pnl_str} | "
+                f"Entry Rs.{row['entry']} Exit Rs.{row['exit_price']} | "
+                f"Qty: {row['qty']} | {row['exit_reason']} | {row['entry_time']} to {row['exit_time']}"
+            )
+            st.caption(row["reasons"])
+            st.markdown("---")
 
 # ===== AUTO REFRESH =====
 if auto_refresh:
